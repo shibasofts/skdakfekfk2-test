@@ -21,9 +21,8 @@ After SSHing into the server, working dir is typically `/workspace`.
 ```bash
 cd /workspace
 
-# Clone the repo (replace with your fork / org as needed).
-git clone https://github.com/<your-org>/equium.git
-cd equium
+git clone https://github.com/shibasofts/equium-gpu.git
+cd equium-gpu
 
 # Install Python dependencies into the active venv.
 pip install -e clients/gpu-miner

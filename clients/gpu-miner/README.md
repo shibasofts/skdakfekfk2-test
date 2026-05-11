@@ -1,108 +1,47 @@
 # equium-gpu-miner
 
-OpenCL GPU miner for Equium ($EQM). Mirrors the structure of `shibasofts/hash256-miner` (OpenCL Keccak ERC-20 miner) but the kernel is Equihash (96, 5) and the chain integration is Solana.
+OpenCL GPU miner for Equium ($EQM) on Solana.
 
-> **Status: v1 — kernel correctness over speed.** One nonce per work-item, bucket sort by 16-bit prefix, sequential Wagner inside each work-item. Optimisation pass (one nonce per work-group, persistent kernel, parallel sort) is a follow-up.
+**Full server deploy guide:** [DEPLOY.md](DEPLOY.md).
 
-## Install
+## Install (Linux + NVIDIA + Python 3.11+)
 
-Requires Python ≥ 3.11 and working **OpenCL** (vendor driver + ICD; NVIDIA's CUDA toolkit, AMD's ROCm/Adrenalin, or Intel's runtime all ship one).
+```bash
+git clone https://github.com/shibasofts/equium-gpu.git
+cd equium-gpu
+pip install -e clients/gpu-miner
 
-```powershell
-cd clients/gpu-miner
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -e .
-
-# Optional but recommended: build the Rust verifier binary (same one the chain
-# uses). If absent, verify.py falls back to a slower pure-Python verifier.
-cd ..\..
+# optional: faster Rust verifier
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+. "$HOME/.cargo/env"
 cargo build -p equium-verify --release
-```
-
-Then sanity-check OpenCL discovery:
-
-```powershell
-equium-gpu-miner devices
 ```
 
 ## Configure
 
-The keypair never goes into a config file. Pass it via env var:
-
 ```bash
-# Base58 (Phantom export):
-export PRIVATE_KEY="2Ng5e...K6iB"
-
-# Or hex (with/without 0x): export PRIVATE_KEY="0xabc123..."
-# Or JSON array:           export PRIVATE_KEY="[1,2,3,...,64]"
-
-export EQM_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"  # optional
+export PRIVATE_KEY="<base58 / hex / JSON-array>"
+export EQM_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
 ```
-
-Or copy `miner.example.toml` → `miner.toml` (gitignored) for non-secret
-settings (RPC URL, GPU device list, batch size).
-
-**See [DEPLOY.md](DEPLOY.md) for the full server deployment guide.**
 
 ## Run
 
-```powershell
-# Dry run against mainnet — no key needed, just sanity-checks the loop:
-equium-gpu-miner run --dry-run
-
-# For real:
+```bash
+cd clients/gpu-miner
+equium-gpu-miner devices
 equium-gpu-miner run
-
-# Single GPU:
-equium-gpu-miner run --devices 0
-
-# Override RPC:
-equium-gpu-miner run --rpc "https://mainnet.helius-rpc.com/?api-key=KEY"
 ```
 
-## How it works
+`--dry-run` builds + signs but never broadcasts. `--batch-size N` per-GPU work-group count (default 64; bump to 256+ on 32 GB cards). `--devices "0,1"` mines on specific cards only.
 
-```
-chain.py  ──poll EquiumConfig PDA──▶ miner.py ──set_job(challenge,target,height)──▶ gpu.py (one OpenCL worker per device)
-                                       ▲                                              │   Hit(nonce, soln)
-                                       │                                              ▼
-                                  submit.py ◀── verify.py (Rust binary or Python fallback) ◀── results queue
-                                       │
-                                       └── build / sign / send  mine(nonce, soln_indices)
-```
+## Files
 
-- Each GPU worker runs `equihash_96_5.cl`, one nonce per work-item. Workspace
-  (rows + bucket counts) lives in global memory, ~38 MB per work-item. On a
-  32 GB 5090, that's room for ~500 concurrent work-items.
-- Every GPU candidate is CPU-re-verified before submission. Disagreement
-  between GPU and CPU = kernel bug; the hit is logged and dropped, not sent.
-- Multi-GPU: one worker thread per device, disjoint random nonce bases.
-- Solution binding to miner pubkey means workers can't be sniped — the I-block
-  embeds your pubkey so a copyist would have to re-solve under their own key.
-
-## Layout
-
-| path | what |
+| | |
 |---|---|
-| `equiumminer/kernels/equihash_96_5.cl` | OpenCL kernel: BLAKE2b leaf gen + 5 Wagner rounds with bucket sort |
-| `equiumminer/gpu.py` | OpenCL device discovery, per-device `GpuWorker`, multi-GPU `GpuFarm` |
-| `equiumminer/chain.py` | Solana RPC wrapper: EquiumConfig PDA reader, ATA derivation |
-| `equiumminer/verify.py` | CPU re-verification — Rust binary if available, else pure Python |
-| `equiumminer/submit.py` | `mine` + `advance_empty_round` instruction builders, tx send |
-| `equiumminer/miner.py` | orchestrator: poll → set job → drain hits → verify → submit |
-| `equiumminer/config.py` | `miner.toml` + env loading; keypair handling |
-| `equiumminer/constants.py` | on-chain constants, Equihash params, instruction discriminators |
-| `equiumminer/cli.py` | `equium-gpu-miner devices|run|selftest` entry points |
-| `../../crates/equium-verify` | Rust binary that re-runs the canonical on-chain verifier from stdin |
-
-## Tuning
-
-- **`--batch-size`** (default 256). Each WI uses ~38 MB workspace; more WI = more parallelism but more VRAM. On 32 GB cards try 512–1024.
-- **`--local-size`** (default 64). Work-group size. Equihash here is embarrassingly parallel across nonces so this doesn't matter much; tune ±2× for ~5–10% throughput on different vendors.
-- **`compute.priority_micro_lamports`** in `miner.toml` — add a small priority fee if you're competing with other miners for the same round.
-
-## Caveats
-
-- This is v1. The kernel is correct (CPU-verifier catches any disagreement) but not maximally fast — a one-nonce-per-WI design leaves a lot of GPU idle. Expect ~5–20 kH/s per RTX 5090 in this revision; an optimized one-nonce-per-WG design can do 10–50×.
-- Never put your private key in `miner.toml`. Use `EQM_KEYPAIR_BASE58` or a path to a JSON keypair file with permissions tightened.
+| `equiumminer/kernels/equihash_96_5.cl` | OpenCL kernel: 1 nonce per WG, parallel BLAKE2b + bucket sort + Wagner |
+| `equiumminer/gpu.py` | device discovery + per-device worker + farm |
+| `equiumminer/chain.py` | EquiumConfig PDA reader, ATA derivation |
+| `equiumminer/submit.py` | `mine` + `advance_empty_round` ix builders |
+| `equiumminer/verify.py` | CPU re-verify (Rust binary if built, else Python fallback) |
+| `equiumminer/miner.py` | main loop |
+| `../../crates/equium-verify` | Rust verifier binary |
