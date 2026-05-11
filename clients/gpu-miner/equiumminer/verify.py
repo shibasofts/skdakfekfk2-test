@@ -199,11 +199,11 @@ def _python_verify(
         return VerifyResult(ok=False, reason="duplicate indices")
 
     # Walk the canonical tree: each level pairs neighbours.
-    leaves = [_gen_leaf(input113, i // C.INDICES_PER, i % C.INDICES_PER) for i in indices]
+    leaves = [_gen_leaf(input113, i // C.INDICES_PER_HASH, i % C.INDICES_PER_HASH) for i in indices]
     sub_indices = [[i] for i in indices]
 
     for r in range(C.EQUIHASH_K):
-        if any(j != 1 for j in [len(leaves) % 2]):
+        if len(leaves) % 2 != 0:
             return VerifyResult(ok=False, reason="odd row count")
         new_leaves: List[bytes] = []
         new_subs: List[List[int]] = []

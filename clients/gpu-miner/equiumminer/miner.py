@@ -13,6 +13,7 @@ State machine (per iteration):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 import time
@@ -107,6 +108,7 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
     last_height_change_at = time.time()
     last_advance_attempt_at = 0.0
     last_config_fetch = 0.0
+    last_hashrate_log = time.time()
     config_poll_interval = 1.0  # seconds
 
     try:
@@ -191,9 +193,24 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                     logger.debug("dropping stale hit from height %d", hit.block_height)
                     continue
 
-                # CPU verify — re-derive challenge from current on-chain state
-                # so we never submit a stale candidate.
+                # FAST PRE-FILTER: kernel emits every valid Equihash solution,
+                # but only ~1 in 2^20 is under target. SHA-256 + lex compare is
+                # microseconds; full Equihash re-verify is ~50ms. Drop hits that
+                # would fail target before paying full verify cost.
                 cfg_now = onchain
+                input81 = chain.build_input_block(
+                    cfg_now.current_challenge, miner_bytes, cfg_now.block_height
+                )
+                pre_hash = hashlib.sha256(hit.soln_indices + input81).digest()
+                if not hash_under_target(pre_hash, cfg_now.current_target):
+                    # Silent drop — expected for nearly all hits.
+                    continue
+                logger.info(
+                    "★ GPU hit under target! dev%d hash 0x%s…",
+                    hit.device_idx,
+                    pre_hash[:6].hex(),
+                )
+
                 if cfg.behaviour.verify_on_cpu:
                     vr = cpu_verify(
                         challenge=cfg_now.current_challenge,
@@ -258,6 +275,21 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                 except Exception as e:
                     reason = submit.classify_submit_err(str(e))
                     logger.warning("submit failed: %s", reason)
+
+            # Periodic hashrate log (every 5s)
+            if now - last_hashrate_log >= 5.0:
+                last_hashrate_log = now
+                elapsed = max(now - stats.started_at, 0.001)
+                total_attempts = sum(farm.stats_attempts)
+                hashrate = total_attempts / elapsed
+                logger.info(
+                    "hashrate %.1f H/s · %d nonces in %.0fs · %d blocks · target 0x%s",
+                    hashrate,
+                    total_attempts,
+                    elapsed,
+                    stats.blocks_mined,
+                    onchain.current_target[:4].hex() if onchain else "?",
+                )
 
             if not drained_any:
                 time.sleep(0.1)

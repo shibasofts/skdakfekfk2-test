@@ -30,11 +30,14 @@ logger = logging.getLogger(__name__)
 
 _KERNEL_PATH = Path(__file__).parent / "kernels" / "equihash_96_5.cl"
 
-# Mirrors the kernel's WORKSPACE_PER_WI macro. Keep in sync.
-WORKSPACE_PER_WI = (
+# Mirrors the kernel's WORKSPACE_PER_WG macro. Keep in sync. One work-group
+# processes one nonce; this is the per-WG (per-nonce) workspace size.
+WORKSPACE_PER_WG = (
     2 * C.N_INIT * 144     # buf_a + buf_b, ROW_BYTES = 144
     + 2 * 65536 * 4        # counts + starts
 )
+# Back-compat alias for callers that haven't moved to the new name.
+WORKSPACE_PER_WI = WORKSPACE_PER_WG
 COMPRESSED_BYTES = 68
 MAX_HITS_PER_BATCH = 16
 
@@ -153,7 +156,11 @@ def select_devices(spec) -> List[int]:
 
 
 class GpuWorker:
-    """One OpenCL queue + program + buffers, sized for one device."""
+    """One OpenCL queue + program + buffers, sized for one device.
+
+    batch_size = number of work-GROUPS launched per kernel call (= nonces tried per launch).
+    local_size = WIs per work-group (cooperate on ONE nonce; default 256).
+    """
 
     def __init__(self, device_idx: int, batch_size: int, local_size: int):
         all_devs = list_devices()
@@ -170,20 +177,24 @@ class GpuWorker:
 
     def _compile(self):
         src = _KERNEL_PATH.read_text()
-        self.program = cl.Program(self.ctx, src).build()
+        # LOCAL_SIZE is required by the kernel's reqd_work_group_size attribute.
+        # -cl-fast-relaxed-math enables a few peephole optimizations on integer ops too.
+        build_opts = f"-cl-fast-relaxed-math -cl-mad-enable -DLOCAL_SIZE={self.local_size}"
+        self.program = cl.Program(self.ctx, src).build(options=build_opts)
         self.kernel = self.program.equihash_96_5
 
     def _alloc_buffers(self):
         mf = cl.mem_flags
-        # Workspace: batch_size × WORKSPACE_PER_WI. Largest single allocation.
-        ws_size = int(self.batch_size) * int(WORKSPACE_PER_WI)
+        # Workspace: batch_size (work-groups) × WORKSPACE_PER_WG. One nonce per WG.
+        ws_size = int(self.batch_size) * int(WORKSPACE_PER_WG)
         logger.info(
-            "device %d (%s): allocating %.1f MB workspace (%d WI × %.1f MB)",
+            "device %d (%s): allocating %.1f MB workspace (%d WGs × %.1f MB, %d WI/WG)",
             self.device_idx,
             self.device.name,
             ws_size / (1 << 20),
             self.batch_size,
-            WORKSPACE_PER_WI / (1 << 20),
+            WORKSPACE_PER_WG / (1 << 20),
+            self.local_size,
         )
         self.buf_workspace = cl.Buffer(self.ctx, mf.READ_WRITE, size=ws_size)
         self.buf_h_base = cl.Buffer(self.ctx, mf.READ_ONLY, size=8 * 8)
@@ -211,8 +222,9 @@ class GpuWorker:
         self.kernel.set_arg(6, self.buf_hit_count)
         self.kernel.set_arg(7, np.uint32(MAX_HITS_PER_BATCH))
 
-        global_size = (self.batch_size,)
-        local_size = (min(self.local_size, self.batch_size),)
+        # batch_size = number of work-GROUPS; each WG processes one nonce.
+        global_size = (self.batch_size * self.local_size,)
+        local_size = (self.local_size,)
         cl.enqueue_nd_range_kernel(self.queue, self.kernel, global_size, local_size)
 
         # Read back hit count, then nonces + solutions if any.

@@ -1,25 +1,19 @@
 /*
- * Equihash (96, 5) OpenCL kernel for Equium.
+ * Equihash (96, 5) OpenCL kernel — v2: one nonce per work-group.
  *
- * Strategy: one nonce per work-item. Each work-item runs the full Wagner solve
- * inside its own workspace slice in global memory. Bucket-sort by 16-bit prefix
- * (cbits = 96/(5+1) = 16) replaces a comparison sort.
+ * 256 work-items in a WG cooperate on a single nonce. Parallelizes:
+ *  - BLAKE2b leaf generation (each WI hashes ~103 batches → ~512 leaves)
+ *  - Histogram (atomic_inc on global per-WG bucket counts)
+ *  - Prefix sum (single WI scans 65536 buckets serially — fast enough)
+ *  - Scatter (each WI moves ~512 rows)
+ *  - Wagner pair-finding (each WI processes ~256 buckets)
+ *  - Final all-zero filter
  *
- * Hardcoded params:
- *   N_INIT          = 131072  (= 2^(cbits+1))
- *   CBITS           = 16
- *   CBYTES          = 2
- *   LEAF_BYTES      = 12      (= 96/8)
- *   INDICES_PER     = 5       (= 512/96)
- *   BLAKE2B_OUT     = 60      (bytes per BLAKE2b call)
- *   SOLN_INDICES    = 32      (= 2^k)
- *   ROW_HASH_BYTES  = 12      (max — shrinks per round)
- *   ROW_IDX_MAX     = 32
+ * Hardcoded params (Equium): N_INIT=131072, CBITS=16, INDICES_PER=5, BLAKE2B_OUT=60.
+ * ROW_BYTES = 12 hash + 4 count + 128 indices (32 max) = 144.
  *
- * Per work-item global workspace ≈ 2 buffers × 131072 rows × 144 bytes
- *                                  + 65536 × 4 bucket counts
- *                                  + 65536 × 4 bucket starts
- *                                ≈ 38 MB / WI.
+ * Workspace per WG = 2*N_INIT*144 + 2*BUCKETS*4 ≈ 38 MB.
+ * On 16 GB: ~430 concurrent WGs. On 32 GB: ~870.
  */
 
 #define N_INIT          131072u
@@ -28,17 +22,20 @@
 #define LEAF_BYTES      12u
 #define INDICES_PER     5u
 #define BLAKE2B_OUT     60u
-#define BLAKE2B_OUT_64  8u           /* 60 bytes lives in h[0..8] u64 words (with 4 unused trailing bytes) */
 #define SOLN_INDICES    32u
 #define K_ROUNDS        5u
-#define BUCKETS         65536u       /* = 2^CBITS */
+#define BUCKETS         65536u
 #define ROW_HASH_BYTES  12u
-#define ROW_IDX_MAX     32u
-#define ROW_BYTES       144u         /* 12 hash + 4 count + 128 indices = 144, aligned */
-#define MAX_HITS_PER_WI 4u
+#define ROW_BYTES       144u
+#define ROW_HASH_OFF    0u
+#define ROW_COUNT_OFF   12u
+#define ROW_IDX_OFF     16u
+#define COMPRESSED_BYTES 68u
+
+#define WORKSPACE_PER_WG (2u * N_INIT * ROW_BYTES + 2u * BUCKETS * 4u)
 
 /* ===================================================================
- * BLAKE2b
+ * BLAKE2b — single-block compression. Used 26215× per nonce per WG.
  * =================================================================== */
 
 __constant ulong BLAKE2B_IV[8] = {
@@ -87,9 +84,6 @@ __constant uchar BLAKE2B_SIGMA[12][16] = {
     G(r, 7, v[ 3], v[ 4], v[ 9], v[14]);                      \
 } while (0)
 
-/* Single-block BLAKE2b compression. h[8] is hash state, m[16] is message words
- * (already LE-loaded), t is bytes-counter LOW (we never exceed 128 bytes total),
- * last=1 for the final/only block. */
 static inline void blake2b_compress(
     ulong h[8],
     const ulong m[16],
@@ -114,26 +108,18 @@ static inline void blake2b_compress(
     for (int i = 0; i < 8; ++i) h[i] ^= v[i] ^ v[i + 8];
 }
 
-/* ===================================================================
- * Leaf hashing
- * =================================================================== */
-
-/* Pack 8 bytes LE into a ulong. */
 static inline ulong load_u64_le(const uchar *p) {
     ulong x = 0;
     for (int i = 7; i >= 0; --i) x = (x << 8) | (ulong)p[i];
     return x;
 }
 
-/* Generate one BLAKE2b output (60 bytes, written into out as LE bytes from h[0..8]).
- * input is 113 bytes; we append batch_idx as 4 LE bytes => 117 total, in one block. */
 static void blake2b_leaf_batch(
-    const ulong h_base[8],     /* precomputed h after IV XOR param */
-    const uchar *input113,     /* 113 bytes: persn (9) + challenge (32) + miner (32) + height (8) + nonce (32) */
-    uint batch_idx,            /* appended as u32 LE */
+    const ulong h_base[8],
+    const uchar *input113,
+    uint batch_idx,
     uchar out60[60]
 ) {
-    /* Build the 128-byte block: 113 bytes of input + 4 bytes batch_idx + 11 zero pad. */
     uchar block[128];
     for (uint i = 0; i < 113; ++i) block[i] = input113[i];
     block[113] = (uchar)(batch_idx       & 0xff);
@@ -143,16 +129,12 @@ static void blake2b_leaf_batch(
     for (uint i = 117; i < 128; ++i) block[i] = 0;
 
     ulong m[16];
-    for (uint i = 0; i < 16; ++i) {
-        m[i] = load_u64_le(&block[i * 8]);
-    }
+    for (uint i = 0; i < 16; ++i) m[i] = load_u64_le(&block[i * 8]);
 
     ulong h[8];
     for (int i = 0; i < 8; ++i) h[i] = h_base[i];
+    blake2b_compress(h, m, 117UL, 1);
 
-    blake2b_compress(h, m, /*t=*/117UL, /*last=*/1);
-
-    /* Emit 60 bytes LE from h[0..8]. */
     for (uint w = 0; w < 8; ++w) {
         ulong x = h[w];
         for (uint b = 0; b < 8; ++b) {
@@ -163,57 +145,34 @@ static void blake2b_leaf_batch(
 }
 
 /* ===================================================================
- * Row layout in global workspace
- *
- *   row_bytes = 144
- *   bytes [ 0.. 12)  current hash (left-justified; round r consumes r*CBYTES leading zeros)
- *   bytes [12..16)   index count (uint LE)
- *   bytes [16..144)  indices, each u32 LE, up to 32 entries
+ * Row helpers (global memory)
  * =================================================================== */
 
-#define ROW_HASH_OFF   0u
-#define ROW_COUNT_OFF  12u
-#define ROW_IDX_OFF    16u
-
 static inline uint row_count(__global const uchar *row) {
-    return (uint)row[ROW_COUNT_OFF]
-         | ((uint)row[ROW_COUNT_OFF + 1] << 8)
-         | ((uint)row[ROW_COUNT_OFF + 2] << 16)
-         | ((uint)row[ROW_COUNT_OFF + 3] << 24);
+    __global const uint *p = (__global const uint *)(row + ROW_COUNT_OFF);
+    return p[0];
 }
 
 static inline void row_set_count(__global uchar *row, uint c) {
-    row[ROW_COUNT_OFF    ] = (uchar)(c        & 0xff);
-    row[ROW_COUNT_OFF + 1] = (uchar)((c >> 8) & 0xff);
-    row[ROW_COUNT_OFF + 2] = (uchar)((c >> 16) & 0xff);
-    row[ROW_COUNT_OFF + 3] = (uchar)((c >> 24) & 0xff);
+    __global uint *p = (__global uint *)(row + ROW_COUNT_OFF);
+    p[0] = c;
 }
 
 static inline uint row_idx_at(__global const uchar *row, uint i) {
-    uint off = ROW_IDX_OFF + i * 4u;
-    return (uint)row[off]
-         | ((uint)row[off + 1] << 8)
-         | ((uint)row[off + 2] << 16)
-         | ((uint)row[off + 3] << 24);
+    __global const uint *p = (__global const uint *)(row + ROW_IDX_OFF);
+    return p[i];
 }
 
 static inline void row_set_idx(__global uchar *row, uint i, uint v) {
-    uint off = ROW_IDX_OFF + i * 4u;
-    row[off    ] = (uchar)(v        & 0xff);
-    row[off + 1] = (uchar)((v >> 8) & 0xff);
-    row[off + 2] = (uchar)((v >> 16) & 0xff);
-    row[off + 3] = (uchar)((v >> 24) & 0xff);
+    __global uint *p = (__global uint *)(row + ROW_IDX_OFF);
+    p[i] = v;
 }
 
-/* The 16-bit bucket key for the current round (round r consumes hash bytes
- * [r*CBYTES .. r*CBYTES + CBYTES]). For (96,5) cbytes = 2. */
-static inline uint row_bucket(__global const uchar *row, uint round) {
-    uint off = round * CBYTES;
-    return ((uint)row[off] << 8) | (uint)row[off + 1];
+static inline uint row_bucket16(__global const uchar *row, uint hash_off) {
+    return ((uint)row[ROW_HASH_OFF + hash_off] << 8)
+         | (uint)row[ROW_HASH_OFF + hash_off + 1];
 }
 
-/* Concatenate index lists in canonical order (min-index subtree first).
- * Matches equihash-core's concat_canonical. */
 static void row_concat_indices(
     __global uchar *out_row,
     __global const uchar *a,
@@ -228,26 +187,37 @@ static void row_concat_indices(
     uint first_count  = (a0 < b0) ? a_count : b_count;
     uint second_count = (a0 < b0) ? b_count : a_count;
 
-    for (uint i = 0; i < first_count; ++i)  row_set_idx(out_row, i,                 row_idx_at(first,  i));
+    for (uint i = 0; i < first_count; ++i)  row_set_idx(out_row, i,                  row_idx_at(first,  i));
     for (uint i = 0; i < second_count; ++i) row_set_idx(out_row, i + first_count, row_idx_at(second, i));
 
     row_set_count(out_row, first_count + second_count);
 }
 
-/* XOR the 12-byte hash of two rows into `out_row`. Round r consumes leading
- * CBYTES, which we then leave as zeros in out_row (so future rounds keep
- * indexing by `round * CBYTES`). */
+/* Vectorized 144-byte row copy: 9 × ulong2. ROW_BYTES = 144 = 9 * 16. */
+static inline void row_copy(__global uchar *dst, __global const uchar *src) {
+    __global ulong2 *d = (__global ulong2 *)dst;
+    __global const ulong2 *s = (__global const ulong2 *)src;
+    d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+    d[3] = s[3]; d[4] = s[4]; d[5] = s[5];
+    d[6] = s[6]; d[7] = s[7]; d[8] = s[8];
+}
+
 static void row_xor_hash(
     __global uchar *out_row,
     __global const uchar *a,
     __global const uchar *b
 ) {
-    for (uint i = 0; i < ROW_HASH_BYTES; ++i) {
-        out_row[ROW_HASH_OFF + i] = a[ROW_HASH_OFF + i] ^ b[ROW_HASH_OFF + i];
-    }
+    /* 12 bytes — do it as one ulong (8) + one uint (4). */
+    __global ulong *out_u = (__global ulong *)(out_row + ROW_HASH_OFF);
+    __global const ulong *a_u = (__global const ulong *)(a + ROW_HASH_OFF);
+    __global const ulong *b_u = (__global const ulong *)(b + ROW_HASH_OFF);
+    out_u[0] = a_u[0] ^ b_u[0];
+    __global uint *out_v = (__global uint *)(out_row + ROW_HASH_OFF + 8);
+    __global const uint *a_v = (__global const uint *)(a + ROW_HASH_OFF + 8);
+    __global const uint *b_v = (__global const uint *)(b + ROW_HASH_OFF + 8);
+    out_v[0] = a_v[0] ^ b_v[0];
 }
 
-/* O(n^2) disjoint-index check (matches equihash-core::distinct_indices). */
 static int rows_disjoint(
     __global const uchar *a, uint a_count,
     __global const uchar *b, uint b_count
@@ -261,28 +231,14 @@ static int rows_disjoint(
     return 1;
 }
 
-/* ===================================================================
- * Per-work-item Wagner solve
- * =================================================================== */
-
-/* Encode the 32 solution indices into compressed bytes.
- *
- * Each index uses (cbits + 1) = 17 bits, MSB-first within the byte stream.
- * Total = 32 * 17 = 544 bits = 68 bytes.
- */
-#define COMPRESSED_BYTES 68u
-
 static void compress_solution(
-    __global const uchar *row,   /* row with SOLN_INDICES = 32 indices */
+    __global const uchar *row,
     __global uchar       *out68
 ) {
-    /* Clear output. */
     for (uint i = 0; i < COMPRESSED_BYTES; ++i) out68[i] = 0;
-
     uint pos = 0;
     for (uint i = 0; i < SOLN_INDICES; ++i) {
         uint idx = row_idx_at(row, i);
-        /* MSB-first emit of 17 bits. */
         for (int b = 16; b >= 0; --b) {
             uint bit = (idx >> b) & 1u;
             uint byte_off = pos >> 3;
@@ -294,65 +250,59 @@ static void compress_solution(
 }
 
 /* ===================================================================
- * Main solver kernel.
+ * MAIN KERNEL — one nonce per work-group.
  *
- * Inputs:
- *   h_base          : 8 ulongs, precomputed BLAKE2b state (IV XOR param)
- *   input113        : 113 bytes (personalization + challenge + miner_pubkey + height + nonce_template)
- *   nonce_offset    : added to gid; final nonce = nonce_offset + gid, written into bytes [105..113]
- *                     of the input copy (first 24 bytes of the 32-byte nonce slot stay as in template).
+ * Launch geometry:
+ *   global_size = n_wgs * local_size
+ *   local_size  = 256 (or 64–512; must divide BUCKETS evenly for cleanliness)
  *
- * Note on nonce layout: the I-block ends at byte 81. Bytes 81..113 = nonce[0..32].
- * We use the LOW 8 bytes (positions 105..113) as a u64 counter; the rest are
- * set from a random base on the host so workers don't collide.
- *
- * Workspace pointer arrangement per WI:
- *   buf_a:   N_INIT rows of ROW_BYTES → 131072 * 144 = 18,874,368 bytes
- *   buf_b:   same
- *   counts:  BUCKETS * 4 = 262,144 bytes
- *   starts:  same
- *   total ≈ 38 MB per WI
+ * One WG = one nonce. WI ids within a WG cooperate via barriers.
  * =================================================================== */
 
-#define WORKSPACE_PER_WI (2u * N_INIT * ROW_BYTES + 2u * BUCKETS * 4u)
-
-__kernel void equihash_96_5(
-    __global const ulong * restrict h_base,    /* [8] precomputed BLAKE2b base state */
-    __global const uchar * restrict input113,  /* [113] persn || I-block || nonce template */
-    ulong nonce_low_offset,                    /* added to gid → low 8 bytes of nonce */
-    __global       uchar * restrict workspace, /* [n_wi * WORKSPACE_PER_WI] */
-    __global       uchar * restrict hit_nonces,    /* [MAX_HITS * 32] */
-    __global       uchar * restrict hit_solutions, /* [MAX_HITS * COMPRESSED_BYTES] */
+__kernel __attribute__((reqd_work_group_size(LOCAL_SIZE, 1, 1)))
+void equihash_96_5(
+    __global const ulong * restrict h_base,
+    __global const uchar * restrict input113,
+    ulong nonce_low_offset,
+    __global       uchar * restrict workspace,
+    __global       uchar * restrict hit_nonces,
+    __global       uchar * restrict hit_solutions,
     volatile __global uint * restrict hit_count,
     uint max_hits
 ) {
-    const uint gid = (uint)get_global_id(0);
+    const uint wgid = (uint)get_group_id(0);
+    const uint lid  = (uint)get_local_id(0);
+    const uint lsz  = (uint)get_local_size(0);
 
-    /* Per-WI workspace slice. */
-    __global uchar *ws       = workspace + (ulong)gid * (ulong)WORKSPACE_PER_WI;
+    __global uchar *ws       = workspace + (ulong)wgid * (ulong)WORKSPACE_PER_WG;
     __global uchar *buf_a    = ws;
     __global uchar *buf_b    = ws + (ulong)N_INIT * ROW_BYTES;
     __global uint  *counts   = (__global uint *)(ws + 2UL * (ulong)N_INIT * ROW_BYTES);
     __global uint  *starts   = counts + BUCKETS;
 
-    /* ---- Build the per-WI input (with nonce baked in) ---- */
+    /* Shared in_count for this round, plus a flag for "row capacity exhausted". */
+    __local uint shared_in_count;
+    __local uint shared_overflow;
+
+    /* Build per-WG input. Every WI computes it (cheap, avoids a barrier).
+     * The nonce is shared by all WIs in the WG (one nonce per WG). */
     uchar input_local[113];
     for (uint i = 0; i < 113; ++i) input_local[i] = input113[i];
-
-    /* Set low 8 bytes of nonce to (nonce_low_offset + gid) LE.
-     * Nonce occupies input bytes [81..113]. Low 8 = [105..113]. */
-    ulong nonce_low = nonce_low_offset + (ulong)gid;
+    ulong nonce_low = nonce_low_offset + (ulong)wgid;
     for (uint b = 0; b < 8; ++b) {
         input_local[105 + b] = (uchar)((nonce_low >> (8 * b)) & 0xff);
     }
 
-    /* ---- Generate N_INIT leaves into buf_a (one index each) ---- */
-    /* 26215 BLAKE2b calls per nonce (= ceil(131072 / 5)). */
+    ulong h_base_priv[8];
+    for (uint i = 0; i < 8; ++i) h_base_priv[i] = h_base[i];
+
+    /* ---- 1. Parallel leaf generation ----
+     * n_batches = ceil(N_INIT / INDICES_PER) = ceil(131072/5) = 26215
+     * Each WI does (26215 + lsz - 1) / lsz batches. */
     const uint n_batches = (N_INIT + INDICES_PER - 1) / INDICES_PER;
     uchar out60[60];
-
-    for (uint batch = 0; batch < n_batches; ++batch) {
-        blake2b_leaf_batch(h_base, input_local, batch, out60);
+    for (uint batch = lid; batch < n_batches; batch += lsz) {
+        blake2b_leaf_batch(h_base_priv, input_local, batch, out60);
         const uint base_leaf = batch * INDICES_PER;
         for (uint sub = 0; sub < INDICES_PER; ++sub) {
             const uint leaf_i = base_leaf + sub;
@@ -364,99 +314,116 @@ __kernel void equihash_96_5(
             row_set_idx(row, 0, leaf_i);
         }
     }
+    barrier(CLK_GLOBAL_MEM_FENCE);
 
-    /* ---- 5 Wagner rounds ---- */
-    uint in_count = N_INIT;
+    /* ---- 2. Five Wagner rounds ---- */
+    if (lid == 0) shared_in_count = N_INIT;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
     __global uchar *cur = buf_a;
     __global uchar *nxt = buf_b;
 
     for (uint round = 0; round < K_ROUNDS; ++round) {
-        /* (1) Histogram + prefix sum to bucket by first 16 bits of CURRENT hash. */
-        for (uint i = 0; i < BUCKETS; ++i) counts[i] = 0u;
-
+        uint in_count = shared_in_count;
         const uint hash_off = round * CBYTES;
-        for (uint i = 0; i < in_count; ++i) {
+
+        /* Zero counts in parallel. */
+        for (uint i = lid; i < BUCKETS; i += lsz) counts[i] = 0u;
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        /* Histogram via global atomic_inc. */
+        for (uint i = lid; i < in_count; i += lsz) {
             __global const uchar *row = cur + (ulong)i * ROW_BYTES;
-            uint b = ((uint)row[ROW_HASH_OFF + hash_off] << 8)
-                   | (uint)row[ROW_HASH_OFF + hash_off + 1];
-            counts[b]++;
+            uint b = row_bucket16(row, hash_off);
+            atomic_inc(&counts[b]);
         }
-        uint acc = 0u;
-        for (uint i = 0; i < BUCKETS; ++i) {
-            starts[i] = acc;
-            acc += counts[i];
-        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
 
-        /* (2) Scatter: copy rows into bucket-sorted positions in `nxt`. */
-        __global uchar *sorted = nxt;
-        /* Reuse `counts` as a write-cursor by re-zeroing it. */
-        for (uint i = 0; i < BUCKETS; ++i) counts[i] = 0u;
-        for (uint i = 0; i < in_count; ++i) {
+        /* Prefix sum — serial on WI 0. 65536 entries × ~2 cycles = ~130k cycles
+         * = ~50μs. Negligible vs Wagner cost. */
+        if (lid == 0) {
+            uint acc = 0u;
+            for (uint i = 0; i < BUCKETS; ++i) {
+                starts[i] = acc;
+                acc += counts[i];
+            }
+        }
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        /* Re-zero counts to use as scatter cursor. */
+        for (uint i = lid; i < BUCKETS; i += lsz) counts[i] = 0u;
+        barrier(CLK_GLOBAL_MEM_FENCE);
+
+        /* Scatter in parallel (vectorized 144-byte row copy). */
+        for (uint i = lid; i < in_count; i += lsz) {
             __global const uchar *row = cur + (ulong)i * ROW_BYTES;
-            uint b = ((uint)row[ROW_HASH_OFF + hash_off] << 8)
-                   | (uint)row[ROW_HASH_OFF + hash_off + 1];
-            uint dst = starts[b] + counts[b]++;
-            __global uchar *out_row = sorted + (ulong)dst * ROW_BYTES;
-            for (uint k = 0; k < ROW_BYTES; ++k) out_row[k] = row[k];
+            uint b = row_bucket16(row, hash_off);
+            uint slot = atomic_inc(&counts[b]);
+            uint dst = starts[b] + slot;
+            __global uchar *out_row = nxt + (ulong)dst * ROW_BYTES;
+            row_copy(out_row, row);
         }
+        barrier(CLK_GLOBAL_MEM_FENCE);
 
-        /* Swap roles so we can write the round output into `cur` again. */
-        __global uchar *tmp = cur; cur = nxt; nxt = tmp;
-        /* Now `cur` holds the bucket-sorted rows; `nxt` is scratch. */
+        /* Swap: cur now holds sorted rows, nxt is scratch for round output. */
+        { __global uchar *t = cur; cur = nxt; nxt = t; }
 
-        /* (3) For each bucket, generate all distinct pairs, XOR + concat. */
-        uint out_count = 0u;
-        for (uint b = 0; b < BUCKETS; ++b) {
+        /* Reset out cursor for pair-finding. */
+        if (lid == 0) { shared_in_count = 0u; shared_overflow = 0u; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        /* Pair-finding in parallel — each WI handles a slice of buckets. */
+        for (uint b = lid; b < BUCKETS; b += lsz) {
             uint b_start = starts[b];
-            uint b_size  = counts[b];   /* counts now holds the bucket sizes */
+            uint b_size  = counts[b];
             if (b_size < 2u) continue;
-            for (uint ia = 0; ia < b_size; ++ia) {
+            for (uint ia = 0u; ia < b_size; ++ia) {
                 __global const uchar *ra = cur + (ulong)(b_start + ia) * ROW_BYTES;
                 uint ra_cnt = row_count(ra);
                 for (uint ib = ia + 1u; ib < b_size; ++ib) {
                     __global const uchar *rb = cur + (ulong)(b_start + ib) * ROW_BYTES;
                     uint rb_cnt = row_count(rb);
                     if (!rows_disjoint(ra, ra_cnt, rb, rb_cnt)) continue;
-                    if (out_count >= N_INIT) goto done_round; /* clamp; in practice ≈ N_INIT */
-                    __global uchar *out_row = nxt + (ulong)out_count * ROW_BYTES;
+                    uint slot = atomic_inc(&shared_in_count);
+                    if (slot >= N_INIT) { shared_overflow = 1u; continue; }
+                    __global uchar *out_row = nxt + (ulong)slot * ROW_BYTES;
                     row_xor_hash(out_row, ra, rb);
                     row_concat_indices(out_row, ra, rb, ra_cnt, rb_cnt);
-                    out_count++;
                 }
             }
         }
-done_round:
-        in_count = out_count;
-        __global uchar *tmp2 = cur; cur = nxt; nxt = tmp2;
+        barrier(CLK_GLOBAL_MEM_FENCE);
 
-        if (in_count == 0u) return;   /* dead nonce */
+        /* Clamp in_count to capacity if we overflowed (excess pairs already
+         * silently dropped via the slot check above). */
+        if (lid == 0 && shared_overflow != 0u) shared_in_count = N_INIT;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        { __global uchar *t = cur; cur = nxt; nxt = t; }
+        /* in_count for next round is whatever we accumulated. */
     }
 
-    /* ---- After 5 rounds: filter all-zero-hash candidates of length SOLN_INDICES ---- */
-    for (uint i = 0; i < in_count; ++i) {
+    /* ---- 3. Final filter ----
+     * Valid rows have count == 32 and all 12 hash bytes zero. */
+    uint final_count = shared_in_count;
+    for (uint i = lid; i < final_count; i += lsz) {
         __global const uchar *row = cur + (ulong)i * ROW_BYTES;
         if (row_count(row) != SOLN_INDICES) continue;
-        /* All 12 hash bytes must be zero after K full rounds (each consumed 2 bytes;
-         * but we kept hash padded — check all 12 for safety). */
         int all_zero = 1;
         for (uint b = 0; b < ROW_HASH_BYTES; ++b) {
             if (row[ROW_HASH_OFF + b] != 0u) { all_zero = 0; break; }
         }
         if (!all_zero) continue;
 
-        /* Record the hit. */
         uint slot = atomic_inc(hit_count);
         if (slot >= max_hits) return;
 
-        /* Write nonce[32] (low 8 bytes are LE counter; high 24 from input template). */
         __global uchar *out_nonce = hit_nonces + (ulong)slot * 32u;
-        /* High 24 from input_local[81..105]; low 8 from nonce_low. */
         for (uint k = 0; k < 24u; ++k) out_nonce[k] = input_local[81u + k];
         for (uint k = 0; k < 8u;  ++k) out_nonce[24u + k] = (uchar)((nonce_low >> (8u * k)) & 0xff);
 
         __global uchar *out_soln = hit_solutions + (ulong)slot * COMPRESSED_BYTES;
         compress_solution(row, out_soln);
-
         return;
     }
 }

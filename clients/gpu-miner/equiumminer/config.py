@@ -59,9 +59,10 @@ class WalletConfig:
 @dataclass
 class GpuConfig:
     devices: Union[str, List[int]] = "all"
-    batch_size: int = 256
-    local_size: int = 64
-    workspace_bytes_per_nonce: int = 3_145_728  # informational; see gpu.WORKSPACE_PER_WI
+    # batch_size = number of work-groups (= nonces) per kernel launch
+    batch_size: int = 128
+    # local_size = WIs per WG; one WG processes one nonce
+    local_size: int = 256
 
 
 @dataclass
@@ -111,9 +112,6 @@ def load_config(toml_path: Optional[Path] = None) -> MinerConfig:
             cfg.gpu.devices = g.get("devices", cfg.gpu.devices)
             cfg.gpu.batch_size = int(g.get("batch_size", cfg.gpu.batch_size))
             cfg.gpu.local_size = int(g.get("local_size", cfg.gpu.local_size))
-            cfg.gpu.workspace_bytes_per_nonce = int(
-                g.get("workspace_bytes_per_nonce", cfg.gpu.workspace_bytes_per_nonce)
-            )
         if "behaviour" in raw:
             b = raw["behaviour"]
             cfg.behaviour.dry_run = bool(b.get("dry_run", cfg.behaviour.dry_run))

@@ -17,14 +17,12 @@ keypair_path = "wallet.json"
 [gpu]
 # "all" = every OpenCL device, or a list of flat indices like [0, 1]
 devices = "all"
-# Number of nonces per kernel launch per device. Auto-tunes around this target.
-# Higher = more VRAM, lower launch overhead. Each nonce takes ~3 MB of workspace.
-batch_size = 256
-# OpenCL work-group size. Each work-item processes one nonce.
-local_size = 64
-# Bytes of workspace per nonce in global memory (leaves + indices + double buffer).
-# 131072 * 12 = 1.5MB leaves, plus ~1.5MB for round buffers, plus indices.
-workspace_bytes_per_nonce = 3_145_728
+# Number of WORK-GROUPS launched per kernel call. Each WG = one nonce (256 WIs
+# cooperate on it). Workspace ≈ 38 MB per WG. 16 GB card → ≤430 WGs, 32 GB → ≤870.
+batch_size = 128
+# WIs per work-group (must match the kernel's reqd_work_group_size and BUCKETS%lsz=0).
+# 256 is a good default; try 128/512 if the compiler prefers.
+local_size = 256
 
 [behaviour]
 # Don't broadcast tx (build/sign/verify only). Useful for first-run sanity.
