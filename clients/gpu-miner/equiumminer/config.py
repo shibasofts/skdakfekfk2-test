@@ -46,14 +46,14 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass
 class NetworkConfig:
-    # Default: equium.xyz's RPC proxy (forwards to a paid Helius, 120 req/min
-    # per IP). Fallbacks: several free public Solana RPCs that are usable for
-    # casual mining; for a real fleet you want your own Helius key.
-    rpc_url: str = "https://equium.xyz/api/rpc"
+    # Defaults: paid Helius + Alchemy endpoints. RpcRotator picks the next one
+    # on any error so a temporary outage on one provider doesn't kill the run.
+    # Public RPCs at the end as a last-resort safety net.
+    rpc_url: str = "https://mainnet.helius-rpc.com/?api-key=4617b489-15c1-44cc-858e-b760f2d280c3"
     rpc_fallbacks: List[str] = field(default_factory=lambda: [
+        "https://solana-mainnet.g.alchemy.com/v2/0YRi1K4PdPkB0BM3iB37BBsij-HTyY2X",
+        "https://equium.xyz/api/rpc",
         "https://api.mainnet-beta.solana.com",
-        "https://solana-rpc.publicnode.com",
-        "https://rpc.ankr.com/solana",
     ])
     program_id: str = C.PROGRAM_ID
 
