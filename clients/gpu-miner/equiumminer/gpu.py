@@ -134,7 +134,7 @@ def build_input113(challenge: bytes, miner_pubkey: bytes, block_height: int, non
 
 
 def list_devices() -> List[cl.Device]:
-    """Flat list of all OpenCL devices across all platforms."""
+    """Flat list of all OpenCL devices across all platforms (incl. CPU)."""
     devs: List[cl.Device] = []
     for plat in cl.get_platforms():
         for d in plat.get_devices():
@@ -142,12 +142,22 @@ def list_devices() -> List[cl.Device]:
     return devs
 
 
+def _is_gpu(d: cl.Device) -> bool:
+    return bool(d.type & cl.device_type.GPU)
+
+
 def select_devices(spec) -> List[int]:
-    """Return flat indices to use given a spec like 'all' or [0, 2] or '0,1'."""
+    """Return flat indices to use given a spec like 'all' or [0, 2] or '0,1'.
+
+    'all' selects only GPU devices — the kernel is tuned for GPU memory
+    layout (38 MB workspace per WG); a CPU OpenCL device technically runs
+    it but wastes RAM for ~5% of one GPU's hashrate. Pass an explicit list
+    if you really want to include CPU.
+    """
     all_devs = list_devices()
     n = len(all_devs)
     if isinstance(spec, str) and spec.lower() == "all":
-        return list(range(n))
+        return [i for i, d in enumerate(all_devs) if _is_gpu(d)]
     if isinstance(spec, str):
         return [int(x.strip()) for x in spec.split(",") if x.strip()]
     if isinstance(spec, (list, tuple)):
