@@ -46,8 +46,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass
 class NetworkConfig:
-    rpc_url: str = "https://api.mainnet-beta.solana.com"
-    rpc_fallbacks: List[str] = field(default_factory=list)
+    # Default to equium.xyz's server-side RPC proxy: it forwards an allow-listed
+    # set of JSON-RPC methods to their paid Helius endpoint, rate-limited at
+    # 120 req/min per IP (plenty for a single miner polling every ~1s). Users
+    # can still override with their own Helius / Triton key for higher throughput.
+    rpc_url: str = "https://equium.xyz/api/rpc"
+    rpc_fallbacks: List[str] = field(default_factory=lambda: ["https://api.mainnet-beta.solana.com"])
     program_id: str = C.PROGRAM_ID
 
 

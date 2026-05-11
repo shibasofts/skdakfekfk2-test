@@ -21,7 +21,9 @@ cargo build -p equium-verify --release
 
 ```bash
 export PRIVATE_KEY="<base58 / hex / JSON-array>"
-export EQM_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+# RPC defaults to equium.xyz/api/rpc (120 req/min, free). Override only if
+# you're running many miners on one IP:
+# export EQM_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
 ```
 
 ## Run

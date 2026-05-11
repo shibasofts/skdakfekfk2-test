@@ -52,9 +52,10 @@ export PRIVATE_KEY="0xabc123..."     # 128 hex chars = full 64-byte secret
 export PRIVATE_KEY="[1,2,3,...,64]"
 ```
 
-For a paid Helius / Triton / Quicknode endpoint (strongly recommended —
-public Solana RPC throttles aggressively when you're submitting 1+
-mine() tx per minute):
+RPC defaults to `https://equium.xyz/api/rpc` — the project's own server-side
+proxy that forwards to a paid Helius endpoint, rate-limited at 120 req/min
+per IP. That's plenty for a single miner (we poll ~1 req/sec). If you're
+running multiple miners on the same IP, set your own endpoint:
 
 ```bash
 export EQM_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"

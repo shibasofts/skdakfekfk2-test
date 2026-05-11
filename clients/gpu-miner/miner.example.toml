@@ -1,11 +1,12 @@
 # Copy to miner.toml (gitignored). Or use env vars (EQM_*).
 
 [network]
-# RPC endpoint. Free Helius / Triton key strongly recommended for sustained mining;
-# the public mainnet endpoint rate-limits aggressively.
-rpc_url = "https://api.mainnet-beta.solana.com"
-# Optional fallback list; rotated on rate-limit/error.
-rpc_fallbacks = []
+# Default: equium.xyz's server-side RPC proxy. Forwards to their paid Helius
+# at 120 req/min per IP. For a fleet of miners on the same IP, switch to your
+# own Helius / Triton URL below.
+rpc_url = "https://equium.xyz/api/rpc"
+# Fallback list, rotated on rate-limit/error.
+rpc_fallbacks = ["https://api.mainnet-beta.solana.com"]
 # Program ID (mainnet default).
 program_id = "ZKGMUfxiRCXFPnqz9zgqAnuqJy15jk7fKbR4o6FuEQM"
 
