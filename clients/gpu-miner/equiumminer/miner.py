@@ -50,6 +50,48 @@ def hash_under_target(hash_bytes: bytes, target: bytes) -> bool:
     return False
 
 
+def _format_base(base: int) -> str:
+    """Format an EQM base-unit amount (6 decimals) for display."""
+    whole = base // 1_000_000
+    frac = base % 1_000_000
+    if frac == 0:
+        return str(whole)
+    return f"{whole}.{frac:06d}".rstrip("0").rstrip(".")
+
+
+def _fmt_hashrate(h: float) -> str:
+    if h >= 1_000_000:
+        return f"{h/1_000_000:.2f} MH/s"
+    if h >= 1_000:
+        return f"{h/1_000:.2f} kH/s"
+    return f"{h:.1f} H/s"
+
+
+def _fmt_duration(sec: float) -> str:
+    if sec >= 3600:
+        return f"{sec/3600:.1f}h"
+    if sec >= 60:
+        return f"{sec/60:.1f}m"
+    return f"{sec:.0f}s"
+
+
+def _estimate_seconds_to_block(hashrate: float, target: bytes) -> Optional[float]:
+    """Rough expected seconds-to-block given the 256-bit target. p(hit) ≈ target/2^256.
+    Counts only the *target* probability — Equihash validity is ~50% per nonce,
+    so the effective per-nonce hit chance is ~half this; we apply that factor."""
+    if hashrate <= 0 or len(target) != 32:
+        return None
+    target_int = int.from_bytes(target, "big")
+    if target_int == 0:
+        return None
+    # Probability a uniformly-random hash is under target.
+    p_target = target_int / (1 << 256)
+    # ~50% of nonces yield a valid Equihash solution; combine.
+    p_hit = p_target * 0.5
+    expected_attempts = 1.0 / max(p_hit, 1e-30)
+    return expected_attempts / hashrate
+
+
 def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
     program_id = Pubkey.from_string(cfg.network.program_id)
     config_pda = chain.find_config_pda(program_id)
@@ -87,12 +129,15 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
     token_program = chain.fetch_mint_owner(rpc.client, initial_cfg.mint)
     miner_ata = chain.derive_ata(miner, initial_cfg.mint, token_program)
 
+    logger.info("=" * 66)
+    logger.info("EQUIUM GPU MINER")
+    logger.info("=" * 66)
     logger.info("miner       %s", miner)
     logger.info("program     %s", program_id)
-    logger.info("config PDA  %s", config_pda)
-    logger.info("vault PDA   %s", vault_pda)
-    logger.info("mint        %s (token program %s)", initial_cfg.mint, token_program)
+    logger.info("mint        %s", initial_cfg.mint)
     logger.info("miner ATA   %s", miner_ata)
+    logger.info("rpc         %s", cfg.network.rpc_url)
+    logger.info("-" * 66)
 
     # Spin up GPU farm.
     from .gpu import select_devices
@@ -137,9 +182,9 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                         last_height_change_at = now
                         last_advance_attempt_at = 0.0
                         logger.info(
-                            "round #%d opened · reward %d base · target 0x%s…",
+                            "ROUND #%d  reward %s EQM  target 0x%s",
                             onchain.block_height,
-                            onchain.current_epoch_reward,
+                            _format_base(onchain.current_epoch_reward),
                             onchain.current_target[:4].hex(),
                         )
                         # Build a fresh nonce template — high 24 bytes random,
@@ -171,15 +216,15 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                 and current_height is not None
             ):
                 last_advance_attempt_at = now
-                logger.info("round stalled %.0fs — calling advance_empty_round", stall)
+                logger.info("round stalled %.0fs -- calling advance_empty_round", stall)
                 try:
                     sig = submit.send_advance_empty_round_tx(
                         rpc.client, keypair, program_id, config_pda
                     )
-                    logger.info("↳ advanced empty round · sig %s…", sig[:8])
+                    logger.info("   advanced empty round  sig %s...", sig[:10])
                 except Exception as e:
                     reason = submit.classify_submit_err(str(e))
-                    logger.info("↳ %s", reason)
+                    logger.info("   advance failed: %s", reason)
 
             # Drain GPU results
             drained_any = False
@@ -206,7 +251,7 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                     # Silent drop — expected for nearly all hits.
                     continue
                 logger.info(
-                    "★ GPU hit under target! dev%d hash 0x%s…",
+                    ">> GPU hit UNDER TARGET on dev%d  hash 0x%s...",
                     hit.device_idx,
                     pre_hash[:6].hex(),
                 )
@@ -232,15 +277,14 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                         )
                         continue
                     logger.info(
-                        "✓ GPU dev%d candidate VERIFIED · hash %s…",
-                        hit.device_idx,
-                        vr.solution_hash_hex[:12],
+                        "   verified by CPU  hash %s...",
+                        vr.solution_hash_hex[:16],
                     )
                 else:
-                    logger.info("✓ GPU dev%d candidate (skipping CPU verify)", hit.device_idx)
+                    logger.info("   (CPU verify skipped)")
 
                 if cfg.behaviour.dry_run:
-                    logger.info("[dry-run] would submit mine tx — skipping")
+                    logger.info("[dry-run] would submit mine tx -- skipping")
                     continue
 
                 # Submit.
@@ -264,32 +308,49 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                     elapsed = max(time.time() - stats.started_at, 0.001)
                     total_attempts = sum(farm.stats_attempts)
                     hashrate = total_attempts / elapsed
+                    logger.info("=" * 66)
                     logger.info(
-                        "★ MINED #%d (+%d base) · sig %s… · total %d blocks · ~%.1f H/s",
+                        "*** MINED BLOCK #%d  +%s EQM  sig %s...  ***",
                         cfg_now.block_height,
-                        cfg_now.current_epoch_reward,
-                        sig[:8],
-                        stats.blocks_mined,
-                        hashrate,
+                        _format_base(cfg_now.current_epoch_reward),
+                        sig[:10],
                     )
+                    logger.info(
+                        "    total: %d blocks  %s EQM earned  %s avg",
+                        stats.blocks_mined,
+                        _format_base(stats.total_earned_base),
+                        _fmt_hashrate(hashrate),
+                    )
+                    logger.info("=" * 66)
                 except Exception as e:
                     reason = submit.classify_submit_err(str(e))
                     logger.warning("submit failed: %s", reason)
 
-            # Periodic hashrate log (every 5s)
+            # Periodic hashrate log (every 5s). Includes a per-device
+            # breakdown (helpful for spotting one underperforming GPU on a
+            # multi-card box) and an expected-time-to-block estimate based on
+            # the current target.
             if now - last_hashrate_log >= 5.0:
                 last_hashrate_log = now
                 elapsed = max(now - stats.started_at, 0.001)
                 total_attempts = sum(farm.stats_attempts)
                 hashrate = total_attempts / elapsed
+                target_hex = onchain.current_target[:4].hex() if onchain else "?"
+                etb = _estimate_seconds_to_block(hashrate, onchain.current_target) if onchain else None
+                etb_str = f" | ~{_fmt_duration(etb)}/block" if etb else ""
                 logger.info(
-                    "hashrate %.1f H/s · %d nonces in %.0fs · %d blocks · target 0x%s",
-                    hashrate,
-                    total_attempts,
-                    elapsed,
+                    "HASHRATE  %s | %d blocks | target 0x%s%s",
+                    _fmt_hashrate(hashrate),
                     stats.blocks_mined,
-                    onchain.current_target[:4].hex() if onchain else "?",
+                    target_hex,
+                    etb_str,
                 )
+                if len(farm.device_names) > 1:
+                    parts = []
+                    for i, name in enumerate(farm.device_names):
+                        dev_hr = farm.stats_attempts[i] / elapsed
+                        parts.append(f"dev{i} {_fmt_hashrate(dev_hr)}")
+                    logger.info("  per-device  %s", "  ".join(parts))
 
             if not drained_any:
                 time.sleep(0.1)

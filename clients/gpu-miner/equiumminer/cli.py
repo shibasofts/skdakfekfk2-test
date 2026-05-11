@@ -15,9 +15,16 @@ from .config import MinerConfig, load_config, load_keypair
 def _setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-5s %(name)s · %(message)s",
+        format="%(asctime)s  %(message)s",
         datefmt="%H:%M:%S",
     )
+    # The Solana RPC client uses httpx, which logs every POST at INFO. With a
+    # 1 Hz poll loop that's a flood. Mute it unless the user actually asked
+    # for DEBUG.
+    if level.upper() != "DEBUG":
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 @click.group(help="Equium OpenCL GPU miner.")
@@ -36,7 +43,7 @@ def devices() -> None:
             mem_mb = int(d.global_mem_size / (1 << 20))
             cu = d.max_compute_units
             click.echo(
-                f"  [{idx}] {d.name}  · {mem_mb} MB · {cu} CUs · "
+                f"  [{idx}] {d.name}  | {mem_mb} MB | {cu} CUs | "
                 f"max wg {d.max_work_group_size}"
             )
             idx += 1

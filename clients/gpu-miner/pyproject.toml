@@ -12,12 +12,9 @@ dependencies = [
     "numpy>=1.26",
     "solana>=0.34",
     "solders>=0.21",
-    "anchorpy>=0.20",
-    "construct>=2.10",
     "tomli>=2.0; python_version < '3.11'",
     "python-dotenv>=1.0",
     "click>=8.1",
-    "rich>=13.7",
     "base58>=2.1",
 ]
 
@@ -34,4 +31,4 @@ equium-gpu-miner = "equiumminer.cli:main"
 include = ["equiumminer*"]
 
 [tool.setuptools.package-data]
-equiumminer = ["kernels/*.cl", "idl.json"]
+equiumminer = ["kernels/*.cl"]

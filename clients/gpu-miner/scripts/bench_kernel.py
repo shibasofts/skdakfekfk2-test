@@ -66,8 +66,8 @@ def main():
         per_nonce_ms = dt * 1000.0 / args.batch
         throughput = args.batch / dt
         print(
-            f"  run {r+1}: {dt*1000:.0f}ms total · {per_nonce_ms:.2f}ms/nonce · "
-            f"{throughput:.1f} nonces/sec · {len(hits)} hits"
+            f"  run {r+1}: {dt*1000:.0f}ms total | {per_nonce_ms:.2f}ms/nonce | "
+            f"{throughput:.1f} nonces/sec | {len(hits)} hits"
         )
 
 

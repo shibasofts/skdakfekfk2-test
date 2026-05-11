@@ -158,23 +158,68 @@ def load_config(toml_path: Optional[Path] = None) -> MinerConfig:
 
 
 def load_keypair(path_or_str: str):
-    """Load a Solana Keypair from either a path to a JSON array or a base58 string env."""
+    """Load a Solana Keypair from one of: env var (preferred) or a file path.
+
+    Env vars (checked in order):
+      PRIVATE_KEY               base58 / hex / JSON-array secret (full 64 bytes or 32-byte seed)
+      EQM_KEYPAIR_BASE58        base58 secret (legacy alias)
+      EQM_KEYPAIR_HEX           hex (with or without 0x prefix)
+
+    File fallback: the configured `wallet.keypair_path` is read as JSON array,
+    base58, or hex, auto-detected.
+
+    The raw secret is never printed.
+    """
     from solders.keypair import Keypair  # local import to keep cli importable without solders
 
-    # Allow env override: EQM_KEYPAIR_BASE58 (raw secret, never logged).
-    raw = os.environ.get("EQM_KEYPAIR_BASE58")
-    if raw:
-        import base58
-        return Keypair.from_bytes(base58.b58decode(raw.strip()))
+    for env_name in ("PRIVATE_KEY", "EQM_KEYPAIR_BASE58", "EQM_KEYPAIR_HEX"):
+        raw = os.environ.get(env_name)
+        if raw and raw.strip():
+            return _parse_secret(raw.strip())
 
-    import json
     p = Path(path_or_str)
     if not p.exists():
         raise FileNotFoundError(
-            f"keypair not found at {p}. Either set EQM_KEYPAIR_BASE58 or "
-            f"place the JSON keypair at the configured path."
+            f"keypair not found. Either set the PRIVATE_KEY env var or place "
+            f"a keypair file at '{p}' (JSON array, base58, or hex)."
         )
-    arr = json.loads(p.read_text())
-    if not isinstance(arr, list) or len(arr) != 64:
-        raise ValueError(f"keypair JSON at {p} must be a 64-byte array")
-    return Keypair.from_bytes(bytes(arr))
+    return _parse_secret(p.read_text().strip())
+
+
+def _parse_secret(s: str):
+    """Auto-detect format. Order: JSON-array, hex (with/without 0x), base58."""
+    from solders.keypair import Keypair
+
+    s = s.strip()
+    if s.startswith("["):
+        import json
+        arr = json.loads(s)
+        if not isinstance(arr, list) or len(arr) not in (32, 64):
+            raise ValueError("JSON keypair must be a 32- or 64-byte array")
+        return _keypair_from_bytes(bytes(arr))
+
+    # Hex (with 0x or pure)
+    hex_str = s[2:] if s.lower().startswith("0x") else s
+    if all(c in "0123456789abcdefABCDEF" for c in hex_str) and len(hex_str) in (64, 128):
+        return _keypair_from_bytes(bytes.fromhex(hex_str))
+
+    # Base58 fallback
+    import base58
+    try:
+        decoded = base58.b58decode(s)
+    except Exception as e:
+        raise ValueError(
+            "couldn't parse secret. Expected one of: JSON array, hex (64 or 128 chars), "
+            "base58. " + str(e)
+        )
+    return _keypair_from_bytes(decoded)
+
+
+def _keypair_from_bytes(b: bytes):
+    """Accept either a 64-byte secret key or a 32-byte seed."""
+    from solders.keypair import Keypair
+    if len(b) == 64:
+        return Keypair.from_bytes(b)
+    if len(b) == 32:
+        return Keypair.from_seed(b)
+    raise ValueError(f"expected 32- or 64-byte secret, got {len(b)} bytes")

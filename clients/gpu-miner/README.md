@@ -28,20 +28,22 @@ equium-gpu-miner devices
 
 ## Configure
 
-```powershell
-cd clients\gpu-miner
-copy miner.example.toml miner.toml
-# Edit miner.toml. The keypair NEVER goes into the toml — only the path does.
+The keypair never goes into a config file. Pass it via env var:
+
+```bash
+# Base58 (Phantom export):
+export PRIVATE_KEY="2Ng5e...K6iB"
+
+# Or hex (with/without 0x): export PRIVATE_KEY="0xabc123..."
+# Or JSON array:           export PRIVATE_KEY="[1,2,3,...,64]"
+
+export EQM_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"  # optional
 ```
 
-Or use env vars:
+Or copy `miner.example.toml` → `miner.toml` (gitignored) for non-secret
+settings (RPC URL, GPU device list, batch size).
 
-```powershell
-$env:EQM_RPC_URL = "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
-$env:EQM_KEYPAIR_BASE58 = "<base58-encoded-64-byte-secret>"
-$env:EQM_GPU_DEVICES = "all"
-$env:EQM_DRY_RUN = "1"     # build/sign but don't broadcast
-```
+**See [DEPLOY.md](DEPLOY.md) for the full server deployment guide.**
 
 ## Run
 
