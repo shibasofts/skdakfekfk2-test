@@ -111,16 +111,31 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
     # Resolve token program once (mint owner). If mint is changed off-chain we'd
     # need to restart; the program never rewrites it once authority is revoked.
     initial_cfg = None
-    for _ in range(5):
+    backoff = 1.0
+    for attempt in range(20):
         try:
             initial_cfg = chain.fetch_config(rpc.client, config_pda)
-            break
+            if initial_cfg is not None:
+                break
+            logger.warning(
+                "rpc fetch_config returned None (endpoint may be wrong network) - rotating from %s",
+                rpc.url,
+            )
         except Exception as e:
-            logger.warning("rpc fetch_config failed: %s, rotating", e)
-            rpc.rotate()
-            time.sleep(1)
+            logger.warning(
+                "rpc fetch_config failed on %s: %s: %s, rotating",
+                rpc.url,
+                type(e).__name__,
+                str(e) or repr(e),
+            )
+        rpc.rotate()
+        time.sleep(backoff)
+        backoff = min(backoff * 1.5, 5.0)
     if initial_cfg is None:
-        raise RuntimeError("could not fetch config PDA from any RPC endpoint")
+        raise RuntimeError(
+            "could not fetch config PDA from any RPC endpoint after 20 attempts; "
+            "set EQM_RPC_URL to your own paid Helius/Triton/Quicknode URL"
+        )
     if initial_cfg.equihash_n != C.EQUIHASH_N or initial_cfg.equihash_k != C.EQUIHASH_K:
         raise RuntimeError(
             f"this kernel is hardcoded for Equihash (96, 5); chain reports "
@@ -166,9 +181,21 @@ def run_miner(cfg: MinerConfig, keypair: Keypair) -> None:
                 try:
                     onchain = chain.fetch_config(rpc.client, config_pda)
                 except Exception as e:
-                    logger.warning("config fetch failed: %s — rotating RPC", e)
+                    logger.warning(
+                        "config fetch failed on %s: %s: %s - rotating",
+                        rpc.url,
+                        type(e).__name__,
+                        str(e) or repr(e),
+                    )
                     rpc.rotate()
                     onchain = None
+                    # Slow down to give the next endpoint a chance to not get
+                    # hit by the same burst that rate-limited the last one.
+                    config_poll_interval = min(config_poll_interval + 1.0, 5.0)
+                else:
+                    if onchain is not None:
+                        # Healthy fetch — back off to the normal cadence.
+                        config_poll_interval = 1.0
 
                 if onchain is not None:
                     if not onchain.mining_open:

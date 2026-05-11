@@ -52,10 +52,10 @@ export PRIVATE_KEY="0xabc123..."     # 128 hex chars = full 64-byte secret
 export PRIVATE_KEY="[1,2,3,...,64]"
 ```
 
-RPC defaults to `https://equium.xyz/api/rpc` — the project's own server-side
-proxy that forwards to a paid Helius endpoint, rate-limited at 120 req/min
-per IP. That's plenty for a single miner (we poll ~1 req/sec). If you're
-running multiple miners on the same IP, set your own endpoint:
+RPC defaults to `https://equium.xyz/api/rpc` with public fallbacks
+(`api.mainnet-beta.solana.com`, `solana-rpc.publicnode.com`,
+`rpc.ankr.com/solana`). Public endpoints **rate-limit aggressively** —
+if you see repeated `config fetch failed` lines, get your own RPC key:
 
 ```bash
 export EQM_RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
