@@ -1,0 +1,1 @@
+"""Equium OpenCL GPU miner."""

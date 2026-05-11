@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "programs/equium",
     "crates/equihash-core",
+    "crates/equium-verify",
     "scripts/verify-bench/programs/verify-bench",
     "clients/cli-miner",
     "clients/web-miner/wasm",

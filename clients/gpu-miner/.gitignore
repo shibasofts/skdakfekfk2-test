@@ -1,0 +1,16 @@
+# local config + secrets
+miner.toml
+wallet.json
+.env
+*.key
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/

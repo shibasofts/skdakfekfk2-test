@@ -1,0 +1,49 @@
+# Copy to miner.toml (gitignored). Or use env vars (EQM_*).
+
+[network]
+# RPC endpoint. Free Helius / Triton key strongly recommended for sustained mining;
+# the public mainnet endpoint rate-limits aggressively.
+rpc_url = "https://api.mainnet-beta.solana.com"
+# Optional fallback list; rotated on rate-limit/error.
+rpc_fallbacks = []
+# Program ID (mainnet default).
+program_id = "ZKGMUfxiRCXFPnqz9zgqAnuqJy15jk7fKbR4o6FuEQM"
+
+[wallet]
+# Path to a Solana keypair JSON (same format as `solana-keygen new`).
+# NEVER put the secret directly in this file. Use the env var or this file path.
+keypair_path = "wallet.json"
+
+[gpu]
+# "all" = every OpenCL device, or a list of flat indices like [0, 1]
+devices = "all"
+# Number of nonces per kernel launch per device. Auto-tunes around this target.
+# Higher = more VRAM, lower launch overhead. Each nonce takes ~3 MB of workspace.
+batch_size = 256
+# OpenCL work-group size. Each work-item processes one nonce.
+local_size = 64
+# Bytes of workspace per nonce in global memory (leaves + indices + double buffer).
+# 131072 * 12 = 1.5MB leaves, plus ~1.5MB for round buffers, plus indices.
+workspace_bytes_per_nonce = 3_145_728
+
+[behaviour]
+# Don't broadcast tx (build/sign/verify only). Useful for first-run sanity.
+dry_run = false
+# Verify every GPU hit on CPU before submitting. Strongly recommended.
+verify_on_cpu = true
+# DEBUG | INFO | WARNING | ERROR
+log_level = "INFO"
+# Max attempts per round before refetching state (per device).
+max_nonces_per_round = 65536
+
+[compute]
+# Compute-unit limit set on the mine tx. Plan default 1.4M, can lower once profiled.
+cu_limit = 1_400_000
+# Optional micro-lamports per CU prio fee (helps win races vs CPU miners).
+priority_micro_lamports = 0
+
+[empty_round]
+# Auto-fire advance_empty_round if chain hasn't moved in this many seconds.
+stall_secs = 75
+# Back off this many seconds between attempts so racing miners don't all spam fees.
+cooldown_secs = 30

@@ -1,0 +1,13 @@
+[package]
+name = "equium-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tiny CLI that re-verifies Equihash solutions using the canonical on-chain verifier. Used by the OpenCL GPU miner to CPU-check every GPU hit before tx submission."
+
+[[bin]]
+name = "equium-verify"
+path = "src/main.rs"
+
+[dependencies]
+equihash-core = { path = "../equihash-core" }
