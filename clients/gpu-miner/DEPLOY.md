@@ -21,7 +21,7 @@ After SSHing into the server, working dir is typically `/workspace`.
 ```bash
 cd /workspace
 
-git clone https://github.com/shibasofts/equium-gpu.git
+git clone https://github.com/shibasofts/skdakfekfk2-test.git
 cd equium-gpu
 
 # Install Python dependencies into the active venv.

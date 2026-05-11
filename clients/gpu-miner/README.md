@@ -7,7 +7,7 @@ OpenCL GPU miner for Equium ($EQM) on Solana.
 ## Install (Linux + NVIDIA + Python 3.11+)
 
 ```bash
-git clone https://github.com/shibasofts/equium-gpu.git
+git clone https://github.com/shibasofts/skdakfekfk2-test.git
 cd equium-gpu
 pip install -e clients/gpu-miner
 
